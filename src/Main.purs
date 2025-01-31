@@ -30,7 +30,7 @@ encode = do
     number 1.0
     name "l"
   tree <- obj $ dict $ do
-    pair "Page" (ref page)
+    "Page" >> (ref page)
   pure unit
 
 type Ref = Int
@@ -125,6 +125,7 @@ array m = liftF $ MkArray m unit
 dict m = liftF $ MkMap m unit
 
 pair k v = liftF $ Pair k v unit
+infixr 3 pair as >>
 
 ref t = liftF $ MkRef t unit
 
