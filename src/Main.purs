@@ -5,107 +5,223 @@ import Data.Map
 import Prelude
 
 import Control.Monad.State (StateT, get, lift, modify_, put, runStateT)
-import Data.Array (last, tail, (:))
+import Data.Array (head, last, tail, (:))
 import Data.Either (Either(..))
 import Data.Foldable (maximum)
 import Data.Generic.Rep (class Generic)
 import Data.Identity (Identity)
-import Data.Maybe (fromMaybe, maybe)
+import Data.Maybe (Maybe(..), fromJust, fromMaybe, maybe)
+import Data.Profunctor (arr)
 import Data.Show.Generic (genericShow)
 import Data.String (joinWith)
 import Data.Tuple (Tuple, fst)
 import Data.Tuple.Nested ((/\))
 import Effect (Effect)
 import Effect.Console (log)
+import Partial.Unsafe (unsafePartial)
 
 main :: Effect Unit
 main = do
-  let a = runStateT (runFreeM runPdf encode) { objs: [], prims: [], refs: [], lazy_ref: [], parent: 0 } 
+  let a = runPdf' encode
   log $ show a
-  log ""
 
-data PdfF a
-  = MkObj (Pdf Unit) (Object -> a)
-  | MkArray (Pdf Unit) a
-  | MkNull a
-  | MkRef Object a
+encode = do
+  page <- obj $ array $ do
+    number 1.0
+    name "l"
+  tree <- obj $ dict $ do
+    pair "Page" (ref page)
+  pure unit
 
--- mkObj :: Pdf Unit -> Pdf Object
--- mkObj = liftF $ MkObj 
+type Ref = Int
+
+data Incomplete
+  = Boolean_ Boolean
+  | Null_
+  | Number_ Number
+  | Integer_ Int
+  | Name_ String
+  | Array_ (Array Incomplete)
+  | Map_ (Array Incomplete)
+  | Pair_ String Incomplete
+  | Ref_ Ref
+  | ParentRef_
+
+derive instance Generic Incomplete _
+instance Show Incomplete where
+  show i = genericShow i
+
+data Complete
+  = Boolean Boolean
+  | Null
+  | Number Number
+  | Integer Int
+  | Name String
+  | Array (Array Complete)
+  | Map (Array (Tuple String Complete))
+  | Ref Ref Ref
+
+instance Show Complete where
+  show (Boolean bool) = show bool
+  show Null = "null"
+  show (Number number) = "number"
+  show (Integer integer) = "integer"
+  show (Name name) = "/" <> name
+  show (Array array) = "[" <> (joinWith " " $ map show array) <> "]"
+  show (Map dict) = "<<\n" <> (joinWith "\n" $ map (\(key /\ value) -> "/" <> key <> " " <> show value) dict) <> "\n>>"
+  show (Ref number gen) = "ref " <> show number
+
+data Object = Object { number :: Int, generation :: Int, inner :: Array Incomplete }
+derive instance Generic Object _
+instance Show Object where
+  show o = genericShow o
 
 type Pdf = Free PdfF
 
+data PdfF a
+  = MkObj (Pdf Unit) (Object -> a)
+  | MkBoolean Boolean a
+  | MkNumber Number a
+  | MkInteger Int a
+  | MkName String a
+  | MkArray (Pdf Unit) a
+  | MkMap (Pair Unit) a
+  | MkPair String (Pdf Unit) a
+  | MkRef Object a
+  | MkParentRef a
+
+type Pair = Free PairF
+
+data PairF a
+  = Pair String (Pdf Unit) a
+
+instance Functor PairF where
+  map f (Pair k m a) = Pair k m (f a)
+
 instance Functor PdfF where
-  map f (MkObj p k) = MkObj p (f <<< k)
-  map f (MkArray a x) = MkArray a (f x)
-  map f (MkNull a) = MkNull (f a)
-  map f (MkRef a x) = MkRef a (f x)
+  map f (MkObj m k) = MkObj m (f <<< k)
+  map f (MkBoolean x a) = MkBoolean x (f a)
+  map f (MkNumber x a) = MkNumber x (f a)
+  map f (MkInteger x a) = MkInteger x (f a)
+  map f (MkName x a) = MkName x (f a)
+  map f (MkArray m a) = MkArray m (f a)
+  map f (MkMap m a) = MkMap m (f a)
+  map f (MkPair k v a) = MkPair k v (f a)
+  map f (MkRef x a) = MkRef x (f a)
+  map f (MkParentRef a) = MkParentRef (f a)
 
-mkObj p = liftF $ MkObj p identity
+obj m = liftF $ MkObj m identity
 
-mkNull = liftF $ MkNull unit
+bool b = liftF $ MkBoolean b unit
 
-mkArray p = liftF $ MkArray p unit
+number n = liftF $ MkNumber n unit
 
-mkRef target = liftF $ MkRef target unit
+integer i = liftF $ MkInteger i unit
 
-data Primitive
-  = Null
-  | Ref Int
-  | Array (Array Primitive)
-derive instance Generic Primitive _
-instance Show Primitive where
-  show obj = genericShow obj
+name n = liftF $ MkName n unit
 
-type Object = { number :: Int, inner :: Array Primitive }
+array m = liftF $ MkArray m unit
 
-type Reference = { src :: Int, dst :: Int }
+dict m = liftF $ MkMap m unit
 
-type PdfState = { objs :: Array Object, prims :: Array Primitive, refs :: Array Reference, lazy_ref :: Array Int, parent :: Int }
+pair k v = liftF $ Pair k v unit
+
+ref t = liftF $ MkRef t unit
+
+parentRef = liftF $ MkParentRef unit
+
+type Reference = { src :: Ref, dst :: Ref }
+
+type PdfState = { objs :: Array Object, stack :: Array (Array Incomplete), cur :: Array Incomplete, objNumber :: Ref, xref :: Array Reference }
+
+runPdf' m = runStateT (runFreeM runPdf m) { objs: [], stack: [[]], cur: [], objNumber: 1, xref: [] }
 
 runPdf :: forall a. PdfF (Pdf a) -> StateT PdfState Identity (Pdf a)
-runPdf f = go f
+runPdf m = go m
   where
-    go (MkObj p contf) = do
-      -- store <- get
-      -- let prevNumber = maybe 0 (_.number) $ last store.objs
-      -- modify_ $ \s -> s { parent = prevNumber + 1 }
-      runFreeM runPdf p
-      -- put store
+    go (MkObj m cont) = do
       prev <- get
-      let prevNumber = maybe 0 (_.number) $ last prev.objs
-      let obj = { number: prevNumber + 1, inner: prev.prims }
-      let ref = prev.refs <> map (\dst -> { src: prevNumber + 1, dst }) prev.lazy_ref
-      modify_ $ \s -> s { objs = s.objs <> [obj], prims = [], refs = ref }
-      pure (contf obj)
-    go (MkArray p cont) = do
-      store <- get
-      put { objs: store.objs, prims: [], refs: store.refs, lazy_ref: store.lazy_ref, parent: store.parent }
-      runFreeM runPdf p
-      modify_ $ \s -> s { prims = store.prims <> [Array s.prims] }
+      let prevNumber = fromMaybe 0 $ maximum (map (\(Object o) -> o.number ) prev.objs)
+      let selfNumber = prevNumber + 1
+      setObjNumber selfNumber
+      saveState
+      runFreeM runPdf m
+      m' <- restoreState
+      let newObj = Object { number: selfNumber, generation: 0, inner: m' }
+      pushObj newObj
+      pure $ cont newObj
+    go (MkBoolean bool cont) = do
+      push $ Boolean_ bool
       pure cont
-    go (MkNull cont) = do
-      modify_ $ \prev -> 
-        prev { prims = prev.prims <> [Null] }
+    go (MkNumber number cont) = do
+      push $ Number_ number
       pure cont
-    go (MkRef target cont) = do
-      modify_ $ \prev -> 
-        prev { prims = prev.prims <> [Ref target.number] }
+    go (MkInteger integer cont) = do
+      push $ Integer_ integer
+      pure cont
+    go (MkName name cont) = do
+      push $ Name_ name
+      pure cont
+    go (MkArray m cont) = do
+      saveState
+      runFreeM runPdf m
+      arr <- restoreState
+      push $ Array_ arr
+      pure cont
+    go (MkMap m cont) = do
+      saveState
+      runFreeM runPair m
+      pairs <- restoreState
+      push $ Map_ pairs
+      pure cont
+    go (MkPair k v cont) = do
+      v' <- call v
+      push $ Pair_ k v'
+      pure cont
+    go (MkRef (Object t) cont) = do
+      push $ Ref_ t.number
+      appendXref t.number =<< getSelfNumber
+      pure cont
+    go (MkParentRef cont) = do
+      push $ ParentRef_
       pure cont
 
-encode ∷ Pdf Unit
-encode = do
-  obj <- mkObj $ do
-    mkNull
-    mkNull
-    mkArray $ do
-      mkNull
-      mkArray $ do
-        mkNull
+    push incomp = do
+      modify_ $ \s -> s { cur = incomp : s.cur }
+    
+    pushObj obj = do
+      modify_ $ \s -> s { objs = s.objs <> [obj] }
+    
+    call m = do
+      saveState
+      runFreeM runPdf m
+      a <- restoreState
+      -- TODO
+      pure $ unsafePartial $ fromJust $ head a
 
-  page <- mkObj $ do
-    mkNull
-    mkRef obj
+    getSelfNumber = do
+      state <- get
+      pure $ state.objNumber
 
-  pure unit
-  -- pure obj
+    appendXref dst src = do
+      modify_ $ \s -> s { xref = s.xref <> [ { src, dst } ]}
+
+    saveState = do
+      prev <- get
+      modify_ $ \s -> s { stack = prev.cur : s.stack, cur = [] }
+    
+    restoreState = do
+      state <- get
+      modify_ $ \s -> s { stack = fromMaybe [] $ tail s.stack, cur = fromMaybe [] $ head s.stack }
+      pure $ state.cur
+    
+    setObjNumber number = do
+      modify_ $ \s -> s { objNumber = number }
+
+    runPair (Pair k m cont) = do
+      v <- call m
+      push $ Pair_ k v
+      pure cont
+
+resolveParentRef :: Array Incomplete -> Array Reference -> Array Complete
+resolveParentRef incomps xref = []
